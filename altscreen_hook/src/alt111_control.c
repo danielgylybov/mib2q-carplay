@@ -1,6 +1,27 @@
 #include "alt111.h"
 #include <string.h>
 
+int alt111_eta_disabled_url(const char *saved, char *out, size_t cap)
+{
+    const char *p;
+    size_t prefix, tail;
+    if (!saved || !out || cap == 0u) return ALT111_INVALID;
+    p = saved;
+    while ((p = strstr(p, "showETA=yes")) != NULL) {
+        if ((p == saved || p[-1] == '?' || p[-1] == '&') &&
+            (p[11] == '\0' || p[11] == '&')) break;
+        p += 11;
+    }
+    if (!p) return ALT111_INVALID;
+    prefix = (size_t)(p - saved) + 8u; /* include "showETA=" */
+    tail = strlen(p + 11);
+    if (prefix + 2u + tail + 1u > cap) return ALT111_NOMEM;
+    memcpy(out, saved, prefix);
+    memcpy(out + prefix, "no", 2u);
+    memcpy(out + prefix + 2u, p + 11, tail + 1u);
+    return ALT111_OK;
+}
+
 static uint64_t after(uint64_t now, unsigned delay)
 {
     return UINT64_MAX - now < delay ? UINT64_MAX : now + delay;

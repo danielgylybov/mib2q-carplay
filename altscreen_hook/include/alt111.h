@@ -37,6 +37,8 @@ struct alt111_profile {
 void alt111_profile_mu1440(struct alt111_profile *p, unsigned hid_ready);
 int alt111_profile_validate(const struct alt111_profile *p);
 const char *alt111_initial_url(void);
+/* Copy a URL while changing exactly the showETA=yes query item to no. */
+int alt111_eta_disabled_url(const char *saved, char *out, size_t cap);
 
 enum alt111_command_type {
     ALT111_CMD_NONE, ALT111_CMD_SHOW, ALT111_CMD_STOP,

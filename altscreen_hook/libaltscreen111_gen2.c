@@ -514,12 +514,14 @@ static uint64_t g2_d2_coalesced;
 /*
  * suggestUI -> showUI. iOS sends suggestUI (empty url list) when a navigation
  * app starts guidance and takes the cluster over. Unanswered, that app never got
- * our URL query: Waze drew no ETA after a reconnect until a GEM switch re-sent
- * showUI (issue #35). The delay lets the hand-over land first and folds a
- * suggestUI burst into one showUI.
+ * our URL query: Waze drew no ETA after a reconnect until a GEM switch changed
+ * showETA=no and then restored showETA=yes (issue #35). The delay lets the
+ * hand-over land first and folds a suggestUI burst into one bounded refresh.
  */
 #define G2_RESHOW_DELAY_MS 1000u
 static uint64_t g2_reshow_due_ms;
+static unsigned g2_eta_refresh_inflight;
+static uint64_t g2_eta_refresh_sequence;
 
 static void gen2_publish_status(void);
 static void gen2_control_projection_on(void);
@@ -3030,15 +3032,20 @@ CFDictionaryRef AirPlayCopyServerInfo(AirPlayReceiverSessionRef session, CFArray
     return info;
 }
 
-static CFMutableDictionaryRef command_showui(void)
+static CFMutableDictionaryRef command_showui_with_url(const char *active_url)
 {
-    char active_url[384];
     CFMutableDictionaryRef req=dict_new(), params=dict_new();
     if(!req||!params){if(req)p_CFRelease(req);if(params)p_CFRelease(params);return NULL;}
-    active_alt_url_copy(active_url,sizeof(active_url));
     set_str(req,"type","showUI"); set_str(params,"uuid",g_alt_uuid); set_str(params,"url",active_url);
     { CFStringRef k=s_cf("params"); p_CFDictionarySetValue(req,k,params); p_CFRelease(k); }
     p_CFRelease(params); return req;
+}
+
+static CFMutableDictionaryRef command_showui(void)
+{
+    char active_url[384];
+    active_alt_url_copy(active_url,sizeof(active_url));
+    return command_showui_with_url(active_url);
 }
 
 static CFMutableDictionaryRef command_force_keyframe(void)
@@ -3374,6 +3381,8 @@ static void gen2_control_release(void)
     if(s)(void)alt111_control_end(&g2_control,s);
     g2_control_session=0;
     g2_reshow_due_ms=0;
+    g2_eta_refresh_inflight=0;
+    ++g2_eta_refresh_sequence;
     pthread_mutex_unlock(&g2_core_lock);
     gen2_publish_status();
 }
@@ -3408,6 +3417,78 @@ static void gen2_command_completion(OSStatus status, CFDictionaryRef response, v
 struct gen2_diag_context {
     const char *label;
 };
+
+struct gen2_eta_refresh_context {
+    uint64_t token;
+    uint64_t control_session;
+    void *airplay_session;
+    unsigned stage;
+    char transient_url[384];
+    char saved_url[384];
+};
+
+static int gen2_eta_refresh_dispatch(struct gen2_eta_refresh_context *ctx);
+
+static void gen2_eta_refresh_completion(OSStatus status, CFDictionaryRef response, void *opaque)
+{
+    struct gen2_eta_refresh_context *ctx=(struct gen2_eta_refresh_context *)opaque;
+    int active=0;
+    (void)response;
+    if(!ctx)return;
+    logf_u2("gen2 ETA refresh completion stage=%s control_session=%llu airplay_session=%p status=%d url=%s",
+            ctx->stage==1u?"disable":"restore",
+            (unsigned long long)ctx->control_session,ctx->airplay_session,
+            (int)status,ctx->stage==1u?ctx->transient_url:ctx->saved_url);
+
+    pthread_mutex_lock(&g2_core_lock);
+    active=(g2_eta_refresh_inflight && ctx->token==g2_eta_refresh_sequence &&
+            ctx->control_session==g2_control_session);
+    pthread_mutex_unlock(&g2_core_lock);
+
+    if(ctx->stage==1u && active){
+        /* Restore even after a failed completion: the phone may have consumed the
+         * transient request, and the saved presentation must remain authoritative. */
+        ctx->stage=2u;
+        if(gen2_eta_refresh_dispatch(ctx)==0)return;
+    }
+
+    pthread_mutex_lock(&g2_core_lock);
+    if(ctx->token==g2_eta_refresh_sequence)g2_eta_refresh_inflight=0;
+    pthread_mutex_unlock(&g2_core_lock);
+    free(ctx);
+}
+
+static int gen2_eta_refresh_dispatch(struct gen2_eta_refresh_context *ctx)
+{
+    AirPlayReceiverSessionRef s=NULL;
+    CFMutableDictionaryRef req=NULL;
+    const char *url;
+    OSStatus e=-1;
+    int valid=0;
+    if(!ctx)return -1;
+    url=ctx->stage==1u?ctx->transient_url:ctx->saved_url;
+    s=retain_active_session();
+    pthread_mutex_lock(&g2_core_lock);
+    valid=(g2_eta_refresh_inflight && ctx->token==g2_eta_refresh_sequence &&
+           ctx->control_session==g2_control_session);
+    pthread_mutex_unlock(&g2_core_lock);
+    if(ctx->stage==1u)ctx->airplay_session=(void *)s;
+    else if(ctx->airplay_session!=(void *)s)valid=0;
+    if(valid&&s)req=command_showui_with_url(url);
+    if(req)e=g_sendcmd(s,req,gen2_eta_refresh_completion,ctx);
+    if(e==K_NO_ERR){
+        logf_u2("gen2 ETA refresh dispatched stage=%s control_session=%llu airplay_session=%p url=%s",
+                ctx->stage==1u?"disable":"restore",
+                (unsigned long long)ctx->control_session,(void *)s,url);
+    }else{
+        logf_u2("gen2 ETA refresh dispatch failed stage=%s control_session=%llu airplay_session=%p valid=%d os=%d url=%s",
+                ctx->stage==1u?"disable":"restore",
+                (unsigned long long)ctx->control_session,(void *)s,valid,(int)e,url);
+    }
+    if(req)p_CFRelease(req);
+    if(s)p_CFRelease(s);
+    return e==K_NO_ERR?0:-1;
+}
 
 static void gen2_diag_completion(OSStatus status, CFDictionaryRef response, void *opaque)
 {
@@ -3654,6 +3735,9 @@ static void gen2_process_diag_markers(void)
 static void gen2_process_reshow(void)
 {
     int rc;
+    uint64_t control_session, eta_token=0;
+    char active_url[384], transient_url[384];
+    struct gen2_eta_refresh_context *eta_ctx=NULL;
     uint64_t now = monotonic_ms();
     pthread_mutex_lock(&g2_core_lock);
     if(!g2_reshow_due_ms || now < g2_reshow_due_ms){
@@ -3661,10 +3745,53 @@ static void gen2_process_reshow(void)
         return;
     }
     g2_reshow_due_ms = 0;
-    rc = g2_control_session ? alt111_control_reshow(&g2_control,g2_control_session) : ALT111_STALE;
+    control_session = g2_control_session;
+    pthread_mutex_unlock(&g2_core_lock);
+    active_alt_url_copy(active_url,sizeof(active_url));
+
+    if(alt111_eta_disabled_url(active_url,transient_url,sizeof(transient_url))==ALT111_OK){
+        pthread_mutex_lock(&g2_core_lock);
+        if(control_session && control_session==g2_control_session && !g2_eta_refresh_inflight){
+            g2_eta_refresh_inflight=1;
+            eta_token=++g2_eta_refresh_sequence;
+            rc=ALT111_OK;
+        }else{
+            rc=g2_eta_refresh_inflight?ALT111_BUSY:ALT111_STALE;
+        }
+        pthread_mutex_unlock(&g2_core_lock);
+        if(rc==ALT111_OK){
+            eta_ctx=(struct gen2_eta_refresh_context *)calloc(1,sizeof(*eta_ctx));
+            if(eta_ctx){
+                eta_ctx->token=eta_token;
+                eta_ctx->control_session=control_session;
+                eta_ctx->stage=1u;
+                snprintf(eta_ctx->transient_url,sizeof(eta_ctx->transient_url),"%s",transient_url);
+                snprintf(eta_ctx->saved_url,sizeof(eta_ctx->saved_url),"%s",active_url);
+                if(gen2_eta_refresh_dispatch(eta_ctx)!=0){
+                    pthread_mutex_lock(&g2_core_lock);
+                    if(eta_ctx->token==g2_eta_refresh_sequence)g2_eta_refresh_inflight=0;
+                    pthread_mutex_unlock(&g2_core_lock);
+                    free(eta_ctx);
+                }
+            }else{
+                pthread_mutex_lock(&g2_core_lock);
+                if(eta_token==g2_eta_refresh_sequence)g2_eta_refresh_inflight=0;
+                pthread_mutex_unlock(&g2_core_lock);
+                rc=ALT111_NOMEM;
+            }
+        }
+        logf_u2("gen2 ownership event source=suggest-ui policy=ETA_TRANSITION control_session=%llu rc=%d transient_url=%s saved_url=%s",
+                (unsigned long long)control_session,rc,transient_url,active_url);
+        return;
+    }
+
+    pthread_mutex_lock(&g2_core_lock);
+    rc = g2_control_session==control_session ?
+         alt111_control_reshow(&g2_control,g2_control_session) : ALT111_STALE;
     pthread_cond_broadcast(&g2_core_cv);
     pthread_mutex_unlock(&g2_core_lock);
-    logf_u2("gen2 suggestUI -> showUI reshow rc=%d",rc);
+    logf_u2("gen2 ownership event source=suggest-ui control_session=%llu rc=%d url=%s",
+            (unsigned long long)control_session,rc,active_url);
 }
 
 static void *gen2_control_worker(void *arg)
@@ -4093,18 +4220,29 @@ static OSStatus mibr_platform_control(AirPlayReceiverSessionRef session, uint32_
      * the wrong ownership contract.  Keep every other PlatformControl command
      * stock-authoritative.
      *
-     * The suggested URL list (empty in every log) is not shown; instead the
-     * worker answers with showUI of our own URL after G2_RESHOW_DELAY_MS.
+     * The suggested URL list (empty in every log) is not shown.  When the saved
+     * URL has ETA enabled, the worker sends one transient showETA=no and restores
+     * the saved showETA=yes URL on completion. ETA-off URLs keep the old reshow.
      */
     if(g_enabled && c && strcmp(c,"suggestUI")==0){
+        uint64_t control_session = 0;
+        char active_url[384], transient_url[384];
+        const char *policy;
         pthread_mutex_lock(&g2_core_lock);
         private111_active = g2_control_session ? 1 : 0;
-        if(private111_active) g2_reshow_due_ms = monotonic_ms() + G2_RESHOW_DELAY_MS;
+        if(private111_active){
+            control_session = g2_control_session;
+            g2_reshow_due_ms = monotonic_ms() + G2_RESHOW_DELAY_MS;
+        }
         pthread_mutex_unlock(&g2_core_lock);
         if(private111_active){
+            active_alt_url_copy(active_url,sizeof(active_url));
+            policy=alt111_eta_disabled_url(active_url,transient_url,sizeof(transient_url))==ALT111_OK ?
+                   "ETA_TRANSITION" : "RESHOW";
             gen2_d2_schedule(G2_D2_SOURCE_SUGGEST_UI,"suggestUI");
-            logf_u2("GEN2 PARITY SUGGEST_UI_ACCEPTED session=%p stock_rc=%d return_rc=0 policy=RESHOW delay_ms=%u",
-                    session,(int)e,G2_RESHOW_DELAY_MS);
+            logf_u2("GEN2 PARITY SUGGEST_UI_ACCEPTED airplay_session=%p control_session=%llu stock_rc=%d return_rc=0 policy=%s delay_ms=%u url=%s",
+                    session,(unsigned long long)control_session,(int)e,
+                    policy,G2_RESHOW_DELAY_MS,active_url);
             return K_NO_ERR;
         }
     }

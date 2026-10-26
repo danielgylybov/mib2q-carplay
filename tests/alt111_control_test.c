@@ -7,6 +7,7 @@
 #include "alt111.h"
 
 #include <stdio.h>
+#include <string.h>
 
 static int failures;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s\n", msg); failures++; } } while (0)
@@ -34,6 +35,33 @@ int main(void)
     struct alt111_control c;
     struct alt111_command cmd;
     uint64_t s;
+    char url[160];
+
+    CHECK(alt111_eta_disabled_url(
+              "maps:/car/instrumentcluster?showETA=yes&showSpeedLimit=no",
+              url, sizeof(url)) == ALT111_OK,
+          "ETA transition URL accepted");
+    CHECK(strcmp(url,
+              "maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no") == 0,
+          "ETA transition changes only yes to no");
+    CHECK(alt111_eta_disabled_url(
+              "maps:/car/instrumentcluster?showSpeedLimit=no&showETA=yes",
+              url, sizeof(url)) == ALT111_OK &&
+          strcmp(url,
+              "maps:/car/instrumentcluster?showSpeedLimit=no&showETA=no") == 0,
+          "ETA transition handles final query item");
+    CHECK(alt111_eta_disabled_url(
+              "maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no",
+              url, sizeof(url)) == ALT111_INVALID,
+          "ETA OFF does not start a transition");
+    CHECK(alt111_eta_disabled_url(
+              "maps:/car/instrumentcluster?notshowETA=yes&showSpeedLimit=no",
+              url, sizeof(url)) == ALT111_INVALID,
+          "ETA transition rejects a substring key");
+    CHECK(alt111_eta_disabled_url(
+              "maps:/car/instrumentcluster?showETA=yes&showSpeedLimit=no",
+              url, 8) == ALT111_NOMEM,
+          "ETA transition fails closed for a short buffer");
 
     CHECK(alt111_control_init(&c, 3) == ALT111_OK, "init");
     s = alt111_control_begin(&c);
